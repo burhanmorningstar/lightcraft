@@ -353,13 +353,42 @@ fn existing_packets(fs: &dyn MoveFs, candidates: &[PathBuf]) -> Vec<PathBuf> {
     existing
 }
 
-/// Choose physical spellings from a complete snapshot; a lone candidate needs no alias decision.
+/// Prefer exact spellings, then a unique physical case alias per naming in a complete snapshot.
 fn resolve_packets(existing: Vec<PathBuf>, listing: Option<&[PathBuf]>) -> std::result::Result<Vec<PathBuf>, String> {
-    let listed: Vec<_> = existing.iter().filter(|p| listing.is_some_and(|paths| paths.contains(p))).cloned().collect();
-    if existing.len() > 1 && (listing.is_none() || listed.is_empty()) {
+    if let Some(listing) = listing {
+        let mut seen = HashSet::new();
+        let mut physical = Vec::new();
+        for candidate in &existing {
+            let base = candidate.with_extension("");
+            if !seen.insert(base.clone()) {
+                continue;
+            }
+            let exact: Vec<_> = existing.iter().filter(|p| p.with_extension("") == base && listing.contains(p)).cloned().collect();
+            if !exact.is_empty() {
+                physical.extend(exact);
+                continue;
+            }
+            let matches: Vec<_> = listing.iter().filter(|p| same_packet_name(candidate, p)).cloned().collect();
+            match matches.as_slice() {
+                [one] => physical.push(one.clone()),
+                [] if existing.len() <= 1 => return Ok(existing),
+                _ => return Err("cannot identify XMP sidecar filenames from the folder listing".into()),
+            }
+        }
+        return Ok(physical);
+    }
+    if existing.len() > 1 {
         return Err("cannot identify XMP sidecar filenames from the folder listing".into());
     }
-    Ok(if listed.is_empty() { existing } else { listed })
+    Ok(existing)
+}
+
+/// Same parent and case-folded filename, without conflating lossy non-Unicode spellings.
+fn same_packet_name(a: &Path, b: &Path) -> bool {
+    a.parent() == b.parent()
+        && a.file_name()
+            .zip(b.file_name())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b) || a.to_str().zip(b.to_str()).is_some_and(|(a, b)| a.to_lowercase() == b.to_lowercase()))
 }
 
 /// The file-system primitives renaming uses. [`RealFs`] is the disk; tests substitute a model of
@@ -380,8 +409,8 @@ pub(crate) trait MoveFs {
     /// Another photo file beside the stem-named sidecar `sidecar` that shares its stem (e.g.
     /// `IMG_1.JPG` for `IMG_1.xmp`), which still uses that sidecar.
     fn stem_sibling(&self, sidecar: &Path) -> Option<String>;
-    /// Candidate paths whose exact spellings are listed, reading each parent directory once.
-    /// Case-insensitive aliases are excluded. `None` means a directory or any entry could not
+    /// Matching entries with their physical spelling, reading each parent directory once.
+    /// Exact and case-folded names are included. `None` means a directory or any entry could not
     /// be read: even a match observed before that failure is an incomplete snapshot.
     fn listed(&self, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
         let mut parents = Vec::new();
@@ -396,8 +425,10 @@ pub(crate) trait MoveFs {
         for parent in parents {
             let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
             for entry in std::fs::read_dir(dir).ok()? {
-                let name = entry.ok()?.file_name();
-                found.extend(paths.iter().filter(|p| p.parent() == Some(parent) && p.file_name() == Some(name.as_os_str())).cloned());
+                let physical = parent.join(entry.ok()?.file_name());
+                if paths.iter().any(|p| same_packet_name(p, &physical)) {
+                    found.push(physical);
+                }
             }
         }
         Some(found)
@@ -609,6 +640,9 @@ pub(crate) struct SidecarMove {
     pub from: PathBuf,
     pub to: PathBuf,
     copied: bool,
+    /// Spelling aliases established by file identity before moving. These locate repairs and
+    /// shared stems; they never prove packet contents or ownership of an occupied destination.
+    aliases: Vec<(PathBuf, PathBuf)>,
     /// Observed packets in the partial move, including the separated source. Absent planned
     /// destinations are never owned; a completed repair advances these observations.
     companions: Vec<RetainedPacket>,
@@ -680,7 +714,9 @@ impl SidecarMove {
         self.validate_packets(fs)?;
         let respelling = is_respelling(fs, &self.from, &self.to);
         // Batch rollback may have restored another photo using this source packet.
-        let copied = self.copied || (!respelling && fs.stem_sibling(&self.from).is_some());
+        let shared = fs.stem_sibling(&self.from).is_some()
+            || self.aliases.iter().any(|(physical, alias)| physical == &self.from && fs.stem_sibling(alias).is_some());
+        let copied = self.copied || (!respelling && shared);
         if fs.exists(&self.to) && (copied || !respelling) {
             return Err(format!("{} already exists while repairing {} → {}", self.to.display(), self.from.display(), self.to.display()));
         }
@@ -698,7 +734,9 @@ impl SidecarMove {
                 || (endpoint.file_name() == path.file_name()
                     && endpoint.parent().zip(path.parent()).is_some_and(|(a, b)| a == b || fs.same_file(a, b)))
         };
-        same_path(&self.from) || same_path(&self.to)
+        same_path(&self.from)
+            || same_path(&self.to)
+            || self.aliases.iter().any(|(physical, alias)| (physical == &self.from || physical == &self.to) && same_path(alias))
     }
 
     fn apply(&self, fs: &dyn MoveFs) -> std::io::Result<()> {
@@ -811,6 +849,17 @@ pub(crate) fn move_file_with(fs: &dyn MoveFs, from: &str, to: &str) -> std::resu
     }
     // Resolve packet spellings before the photo moves, so tracking and moving use the same entries.
     let sidecars = sidecars(from, fs).map_err(fail)?;
+    let mut source_aliases = HashMap::new();
+    for (physical, naming) in &sidecars {
+        let Some(ext) = physical.extension() else { continue };
+        let canonical = crate::sidecar::sidecar_path(from, *naming).with_extension(ext);
+        if physical != &canonical {
+            if !fs.same_file(physical, &canonical) {
+                return Err(fail(format!("cannot verify XMP case alias {}", physical.display())));
+            }
+            source_aliases.insert(physical.clone(), canonical);
+        }
+    }
     let mut packets: Vec<RetainedPacket> =
         sidecars.iter().map(|(path, _)| RetainedPacket { version: fs.packet_version(path).ok(), path: path.clone() }).collect();
     move_one(fs, f, t).map_err(|e| fail(format!("rename {from}: {e}")))?;
@@ -821,8 +870,10 @@ pub(crate) fn move_file_with(fs: &dyn MoveFs, from: &str, to: &str) -> std::resu
             dst = dst.with_extension(ext);
         }
         // A stem sidecar another photo still uses is copied, not taken away (issue #92).
-        let copied = naming == SidecarNaming::Stem && fs.stem_sibling(&sc).is_some();
-        SidecarMove { from: sc, to: dst, copied, companions: Vec::new() }
+        let copied = naming == SidecarNaming::Stem
+            && (fs.stem_sibling(&sc).is_some() || fs.stem_sibling(&crate::sidecar::sidecar_path(from, naming)).is_some());
+        let aliases = source_aliases.get(&sc).map(|alias| (sc.clone(), alias.clone())).into_iter().collect();
+        SidecarMove { from: sc, to: dst, copied, aliases, companions: Vec::new() }
     });
     while let Some(m) = remaining.next() {
         if !m.needed(fs) {
@@ -861,7 +912,13 @@ pub(crate) fn move_file_with(fs: &dyn MoveFs, from: &str, to: &str) -> std::resu
                     let aliases = packet_aliases(&packets, fs, &m.to);
                     if let Err(e) = move_one(fs, &m.to, &m.from) {
                         message.push_str(&format!("; sidecar {} could not be moved back ({e}): it is now {}", m.from.display(), m.to.display()));
-                        pending_sidecars.push(SidecarMove { from: m.to.clone(), to: m.from.clone(), copied: false, companions: Vec::new() });
+                        pending_sidecars.push(SidecarMove {
+                            from: m.to.clone(),
+                            to: m.from.clone(),
+                            copied: false,
+                            aliases: m.aliases.clone(),
+                            companions: Vec::new(),
+                        });
                     } else {
                         advance_packets(&mut packets, &aliases, &m.from, false, fs);
                     }
@@ -1354,7 +1411,7 @@ pub(crate) mod tests {
         fn listed(&self, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
             self.listing_calls.set(self.listing_calls.get() + 1);
             let files = self.files.borrow();
-            Some(paths.iter().filter(|p| files.iter().any(|(f, _)| f.replace('\\', "/") == Self::norm(p))).cloned().collect())
+            Some(files.iter().map(|(p, _)| PathBuf::from(p)).filter(|p| paths.iter().any(|c| same_packet_name(c, p))).collect())
         }
         fn stem_sibling(&self, sidecar: &Path) -> Option<String> {
             let stem = Self::norm(&sidecar.with_extension(""));
@@ -1414,6 +1471,7 @@ pub(crate) mod tests {
                         from: old_sidecar.clone(),
                         to: sidecar.clone(),
                         copied,
+                        aliases: Vec::new(),
                         companions: vec![RetainedPacket { path: old_sidecar.clone(), version: Some(RealFs.packet_version(&old_sidecar).unwrap()) }],
                     };
                     match queue {
@@ -1571,6 +1629,112 @@ pub(crate) mod tests {
             assert_eq!(packets.len(), 2);
             assert_eq!(fs.listing_calls.get(), 1, "save resolves all suffixes together: {ci}");
         }
+    }
+
+    /// Case-insensitive volumes resolve a differently cased stem to its physical packet spelling.
+    #[test]
+    fn xmp_stem_case_aliases_resolve_without_guessing() {
+        let candidates: Vec<_> = ["IMG_1", "IMG_1.JPG"]
+            .into_iter()
+            .flat_map(|stem| crate::sidecar::XMP_SUFFIXES.map(|ext| Path::new("/p").join(format!("{stem}.{ext}"))))
+            .collect();
+        for packets in [
+            vec![("/p/img_1.xMp", "stem")],
+            vec![("/p/img_1.jpg.Xmp", "full")],
+            vec![("/p/img_1.xMp", "stem"), ("/p/img_1.jpg.Xmp", "full")],
+            vec![("/p/img_1.xMp", "stem"), ("/p/IMG_1.JPG.Xmp", "full")],
+            vec![("/p/IMG_1.xMp", "stem"), ("/p/img_1.jpg.Xmp", "full")],
+        ] {
+            let mut files = vec![("/p/IMG_1.JPG", "photo")];
+            files.extend(packets.iter().copied());
+            let fs = FakeFs::new(true, &files);
+            let expected: Vec<_> = packets.iter().map(|(path, _)| PathBuf::from(path)).collect();
+            assert_eq!(listed_packets(&fs, &candidates).unwrap(), expected);
+            let reversed: Vec<_> = ["IMG_1.JPG", "IMG_1"]
+                .into_iter()
+                .flat_map(|stem| crate::sidecar::XMP_SUFFIXES.map(|ext| Path::new("/p").join(format!("{stem}.{ext}"))))
+                .collect();
+            assert_eq!(listed_packets(&fs, &reversed).unwrap(), expected.into_iter().rev().collect::<Vec<_>>());
+            move_file_with(&fs, "/p/IMG_1.JPG", "/p/NEXT.JPG").unwrap();
+            let mut expected = vec![("/p/NEXT.JPG".into(), "photo".into())];
+            expected.extend(packets.iter().map(|(path, bytes)| {
+                let base = if path.to_ascii_lowercase().contains(".jpg.") { "/p/NEXT.JPG" } else { "/p/NEXT" };
+                (format!("{base}.{}", Path::new(path).extension().unwrap().to_str().unwrap()), bytes.to_string())
+            }));
+            expected.sort();
+            assert_eq!(fs.listing(), expected);
+        }
+        // An exact spelling keeps precedence over a different entry that folds to the same name.
+        let fs = FakeFs::new(true, &[("/p/IMG_1.JPG", "photo"), ("/p/IMG_1.xmp", "exact"), ("/p/img_1.xmp", "other")]);
+        assert_eq!(listed_packets(&fs, &candidates).unwrap(), vec![PathBuf::from("/p/IMG_1.xmp")]);
+        // With no exact spelling, two folded matches cannot be assigned safely.
+        let fs = FakeFs::new(true, &[("/p/IMG_1.JPG", "photo"), ("/p/img_1.xmp", "first"), ("/p/Img_1.xmp", "second")]);
+        let before = fs.listing();
+        assert!(listed_packets(&fs, &candidates).is_err());
+        let error = move_file_with(&fs, "/p/IMG_1.JPG", "/p/NEXT.JPG").unwrap_err();
+        assert!(!error.moved && error.pending_sidecars.is_empty());
+        assert_eq!(fs.listing(), before);
+        // On a sensitive volume a differently cased stem belongs to a different file.
+        let fs = FakeFs::new(false, &[("/p/IMG_1.JPG", "photo"), ("/p/img_1.xmp", "other")]);
+        assert!(listed_packets(&fs, &candidates).unwrap().is_empty());
+        move_file_with(&fs, "/p/IMG_1.JPG", "/p/NEXT.JPG").unwrap();
+        assert_eq!(fs.listing(), vec![("/p/NEXT.JPG".into(), "photo".into()), ("/p/img_1.xmp".into(), "other".into())]);
+        // A raw still using the original photo's stem keeps its shared packet when the JPEG moves.
+        let fs = FakeFs::new(true, &[("/p/IMG_1.JPG", "photo"), ("/p/IMG_1.RAW", "raw"), ("/p/img_1.xMp", "shared")]);
+        move_file_with(&fs, "/p/IMG_1.JPG", "/p/NEXT.JPG").unwrap();
+        assert_eq!(
+            fs.listing(),
+            vec![
+                ("/p/IMG_1.RAW".into(), "raw".into()),
+                ("/p/NEXT.JPG".into(), "photo".into()),
+                ("/p/NEXT.xMp".into(), "shared".into()),
+                ("/p/img_1.xMp".into(), "shared".into())
+            ]
+        );
+    }
+
+    /// Established aliases still locate absent rollback targets and protect restored shared stems.
+    #[test]
+    fn xmp_stem_case_aliases_remain_owned_during_repairs() {
+        let files = [("/p/IMG_1.JPG", "photo"), ("/p/img_1.xMp", "stem"), ("/p/img_1.jpg.Xmp", "full")];
+        let fs = FakeFs::new(true, &files);
+        let before = fs.listing();
+        *fs.fail.borrow_mut() = vec!["/p/img_1.jpg.Xmp".into(), "/p/NEXT.xMp".into()];
+        let mut error = move_file_with(&fs, "/p/IMG_1.JPG", "/p/NEXT.JPG").unwrap_err();
+        assert!(!error.moved);
+        assert_eq!(error.pending_sidecars.len(), 1);
+        let candidates: Vec<_> = ["IMG_1", "IMG_1.JPG"]
+            .into_iter()
+            .flat_map(|stem| crate::sidecar::XMP_SUFFIXES.map(|ext| Path::new("/p").join(format!("{stem}.{ext}"))))
+            .collect();
+        let partial = fs.listing();
+        assert!(retry_sidecars_for_paths(&fs, &mut error.pending_sidecars, &candidates).is_err(), "a save must see its blocked repair");
+        assert_eq!(fs.listing(), partial);
+        assert_eq!(error.pending_sidecars.len(), 1);
+        fs.fail.borrow_mut().clear();
+        retry_sidecars_for_paths(&fs, &mut error.pending_sidecars, &candidates).unwrap();
+        assert!(error.pending_sidecars.is_empty());
+        assert_eq!(fs.listing(), before, "restore the physical spelling before allowing a fresh save");
+
+        let fs = FakeFs::new(true, &files);
+        *fs.fail.borrow_mut() = vec!["/p/img_1.xMp".into(), "/p/NEXT.JPG".into()];
+        let mut error = move_file_with(&fs, "/p/IMG_1.JPG", "/p/NEXT.JPG").unwrap_err();
+        assert!(error.moved);
+        fs.fail.borrow_mut().clear();
+        // Another member of a batch can restore a sibling after this operation was queued.
+        fs.files.borrow_mut().push(("/p/IMG_1.RAW".into(), b"raw".to_vec()));
+        retry_sidecars(&fs, &mut error.pending_sidecars).unwrap();
+        assert!(error.pending_sidecars.is_empty());
+        assert_eq!(
+            fs.listing(),
+            vec![
+                ("/p/IMG_1.RAW".into(), "raw".into()),
+                ("/p/NEXT.JPG".into(), "photo".into()),
+                ("/p/NEXT.JPG.Xmp".into(), "full".into()),
+                ("/p/NEXT.xMp".into(), "stem".into()),
+                ("/p/img_1.xMp".into(), "stem".into())
+            ]
+        );
     }
 
     /// Recognized sidecar spellings move with the photo and remain tracked after partial failures.
