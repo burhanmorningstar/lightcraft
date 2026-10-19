@@ -31,6 +31,46 @@ fn ids(v: &Value, key: &str) -> usize {
 }
 
 #[test]
+fn folder_import_finds_jpe_and_jfif_jpegs_in_any_case() {
+    let src = temp_dir("jpeg-extensions");
+    let mut paths = Vec::new();
+    for (i, name) in ["a.jpe", "nested/b.JPE", "c.jfif", "nested/d.JFIF", "e.jpeg", "nested/f.JPG"].iter().enumerate() {
+        let img = lightcraft_raster::Rgba8::from_fn(48, 32, |x, y| [(x * 5) as u8, (y * 7) as u8, (i * 30) as u8, 255]);
+        let bytes = lightcraft_codecs::encode_jpeg(
+            &lightcraft_codecs::EncodeImage::rgba8(&img),
+            90,
+            lightcraft_codecs::ChromaSubsampling::default(),
+            &lightcraft_codecs::EncodeMeta::default(),
+        )
+        .unwrap();
+        let path = src.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        paths.push(path.to_string_lossy().to_string());
+    }
+    // The decoder already accepts each file; finding them in a folder must agree.
+    let mut direct = Session::new().with_fs();
+    let r = direct.execute("library.import", &json!({"paths": paths})).unwrap();
+    assert_eq!(ids(&r, "imported"), 6, "explicit JPEG files: {r}");
+    assert_eq!(ids(&r, "failed"), 0, "{r}");
+
+    let mut s = Session::new().with_fs();
+    let preview = s.execute("library.importPreview", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(preview["scanned"], 6, "folder review must find every JPEG: {preview}");
+    let mut names: Vec<&str> = preview["candidates"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["a.jpe", "b.JPE", "c.jfif", "d.JFIF", "e.jpeg", "f.JPG"]);
+    assert_eq!(s.catalog.len(), 0, "reviewing does not import the photos");
+
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(r["scanned"], 6, "{r}");
+    assert_eq!(ids(&r, "imported"), 6, "{r}");
+    assert_eq!(ids(&r, "failed"), 0, "{r}");
+    assert!(s.catalog.photos().all(|p| p.width == 48 && p.height == 32));
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
 fn recursive_import_with_duplicates() {
     let src = temp_dir("src");
     write_png(&src.join("a.png"), 1);
