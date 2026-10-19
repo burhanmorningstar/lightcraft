@@ -36,6 +36,9 @@ use serde_json::Value;
 
 use crate::{EngineError, Result, Session};
 
+/// Every ASCII XMP suffix case, retaining the original read/save precedence first.
+pub(crate) const XMP_SUFFIXES: [&str; 8] = ["xmp", "XMP", "Xmp", "xmP", "xMp", "xMP", "XmP", "XMp"];
+
 /// Sidecar file naming.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -89,7 +92,7 @@ pub(crate) fn sidecar_candidates(original: &str, naming: SidecarNaming) -> impl 
             }
             v
         })
-        .flat_map(|p| ["xmp", "XMP", "Xmp", "xmP", "xMp", "xMP", "XmP", "XMp"].map(|ext| p.with_extension(ext)))
+        .flat_map(|p| XMP_SUFFIXES.map(|ext| p.with_extension(ext)))
 }
 
 /// What a sidecar (or embedded XMP packet) says about a photo. `None` = not stated.
@@ -646,7 +649,7 @@ impl Session {
             .filter(|n| *n != SidecarNaming::Stem || owners.naming(p, SidecarNaming::Stem) == SidecarNaming::Stem)
             .flat_map(|n| {
                 let path = sidecar_path(orig, n);
-                [path.clone(), path.with_extension("XMP")]
+                XMP_SUFFIXES.map(|ext| path.with_extension(ext))
             })
             .collect();
         // A separated packet is still the photo's metadata. Repair it before a fresh write
@@ -657,10 +660,8 @@ impl Session {
         // subsequent Undo/Redo writes. Shared stems owned by another photo were excluded above.
         // On a case-insensitive volume `a.xmp` also answers for `a.XMP`: the spelling the folder
         // lists comes first, so the atomic write doesn't rename the packet.
-        use crate::rename::MoveFs;
-        let existing: Vec<PathBuf> = candidates.into_iter().filter(|path| path.is_file()).collect();
-        let listed = existing.iter().find(|path| crate::rename::RealFs.listed(path)).cloned();
-        let path = listed.or_else(|| existing.into_iter().next()).unwrap_or(preferred);
+        let existing = crate::rename::listed_packets(&crate::rename::RealFs, &candidates).map_err(EngineError::Other)?;
+        let path = existing.into_iter().next().unwrap_or(preferred);
         self.validate_sidecar_packets_for_paths(std::slice::from_ref(&path), &crate::rename::RealFs)?;
         let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         let err = |e: std::io::Error| EngineError::Other(format!("{}: {e}", path.display()));

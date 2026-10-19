@@ -1167,6 +1167,53 @@ const OTHER_APP_SIDECAR: &str = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTc
 </x:xmpmeta>
 <?xpacket end="w"?>"#;
 
+/// Every recognized XMP suffix keeps its spelling and foreign properties across writes and undo.
+#[test]
+fn xmp_case_variants_keep_foreign_metadata_and_spelling_on_save() {
+    use crate::sidecar::{SidecarNaming, sidecar_path};
+    let root = temp_dir("case-save");
+    let image = lightcraft_raster::Rgba8::from_fn(8, 6, |_, _| [40, 80, 120, 255]);
+    let jpeg = crate::export::encode_image(&image, &crate::export::ExportOptions { format: crate::export::ExportFormat::Jpeg, ..Default::default() })
+        .unwrap();
+    for naming in [SidecarNaming::Stem, SidecarNaming::Full] {
+        for (i, suffix) in ["xmp", "XMP", "Xmp", "xmP", "xMp", "xMP", "XmP", "XMp"].iter().enumerate() {
+            let dir = root.join(format!("{naming:?}-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let original = dir.join("photo.JFIF");
+            std::fs::write(&original, &jpeg).unwrap();
+            let sidecar = sidecar_path(&original.to_string_lossy(), naming).with_extension(suffix);
+            std::fs::write(&sidecar, OTHER_APP_SIDECAR).unwrap();
+            let mut s = Session::new().with_fs();
+            s.open_library(dir.join("library"), false).unwrap();
+            s.execute("library.import", &json!({"paths": [original]})).unwrap();
+            let id = only(&s);
+            s.selection = crate::Selection::single(id);
+            // An existing packet is reused even when the naming preference changes.
+            s.xmp.naming = if naming == SidecarNaming::Stem { SidecarNaming::Full } else { SidecarNaming::Stem };
+            s.execute("photo.rate", &json!({"rating": 4})).unwrap();
+            let saved = s.save_sidecar(id).unwrap();
+            assert!(saved.merged, "{naming:?}, {suffix}: merge the existing packet");
+            assert_eq!(saved.path, sidecar, "keep the packet's exact spelling");
+            s.xmp.auto_write = true;
+            for (command, params, rating) in [("photo.rate", json!({"rating": 5}), 5), ("edit.undo", json!({}), 4), ("edit.redo", json!({}), 5)] {
+                s.execute(command, &params).unwrap();
+                assert_eq!(s.unsaved_sidecars(), 0);
+                let text = std::fs::read_to_string(&sidecar).unwrap();
+                assert!(text.contains("other:Secret=\"keep me\""), "{command}: foreign metadata retained");
+                assert_eq!(lightcraft_meta::parse_xmp(&text).unwrap().metadata.rating, Some(rating), "{command}");
+                let packets: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xmp")))
+                    .map(|e| e.file_name())
+                    .collect();
+                assert_eq!(packets, vec![sidecar.file_name().unwrap().to_os_string()], "one packet, retaining its exact spelling");
+            }
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Issue #92: saving merges into another app's sidecar instead of replacing it.
 #[test]
 fn saving_merges_into_another_apps_sidecar() {
