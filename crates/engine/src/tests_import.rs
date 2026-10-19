@@ -70,6 +70,50 @@ fn folder_import_finds_jpe_and_jfif_jpegs_in_any_case() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+/// JPE/JFIF JPEG imports retain metadata from stem/full sidecars with every XMP suffix case.
+#[test]
+fn jpeg_alias_import_reads_every_xmp_suffix_case() {
+    use crate::sidecar::{SidecarNaming, sidecar_path};
+    let src = temp_dir("jpeg-sidecar-cases");
+    let mut expected = Vec::new();
+    for ext in ["JPE", "JFIF"] {
+        for naming in [SidecarNaming::Stem, SidecarNaming::Full] {
+            for suffix in ["xmp", "xmP", "xMp", "xMP", "Xmp", "XmP", "XMp", "XMP"] {
+                let i = expected.len();
+                let name = format!("IMG_{i}.{ext}");
+                let path = src.join(&name);
+                let img = lightcraft_raster::Rgba8::from_fn(48, 32, |x, y| [(x * 5) as u8, (y * 7) as u8, (i * 7) as u8, 255]);
+                let bytes = lightcraft_codecs::encode_jpeg(
+                    &lightcraft_codecs::EncodeImage::rgba8(&img),
+                    90,
+                    lightcraft_codecs::ChromaSubsampling::default(),
+                    &lightcraft_codecs::EncodeMeta::default(),
+                )
+                .unwrap();
+                std::fs::write(&path, bytes).unwrap();
+                let rating = (i % 5 + 1) as u8;
+                let metadata = lightcraft_meta::Metadata { rating: Some(rating as i8), ..Default::default() };
+                let sidecar = sidecar_path(&path.to_string_lossy(), naming).with_extension(suffix);
+                std::fs::write(sidecar, lightcraft_meta::write_xmp(&metadata, None)).unwrap();
+                expected.push((name, rating));
+            }
+        }
+    }
+    for naming in [SidecarNaming::Stem, SidecarNaming::Full] {
+        let mut s = Session::new().with_fs();
+        s.execute("library.xmpPreferences", &json!({"naming": naming})).unwrap();
+        let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+        assert_eq!(ids(&r, "imported"), expected.len(), "{naming:?}: {r}");
+        assert_eq!(ids(&r, "failed"), 0, "{r}");
+        assert_eq!(r["sidecars"], expected.len(), "{naming:?}: {r}");
+        for (name, rating) in &expected {
+            let p = s.catalog.photos().find(|p| &p.file_name == name).unwrap();
+            assert_eq!(p.rating, *rating, "{name}, {naming:?}: sidecar rating retained");
+        }
+    }
+    std::fs::remove_dir_all(src).unwrap();
+}
+
 #[test]
 fn recursive_import_with_duplicates() {
     let src = temp_dir("src");
