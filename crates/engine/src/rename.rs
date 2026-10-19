@@ -309,7 +309,7 @@ pub fn expand_tokens_with(
 
 /// Existing sidecars of `path`, both namings and every XMP suffix case, preferring listed spellings.
 fn sidecars(path: &str, fs: &dyn MoveFs) -> std::result::Result<Vec<(PathBuf, SidecarNaming)>, String> {
-    let mut v = Vec::new();
+    let mut groups = Vec::new();
     for naming in [SidecarNaming::Stem, SidecarNaming::Full] {
         let p = crate::sidecar::sidecar_path(path, naming);
         // Preserve the existing XMP-before-xmp order when both are distinct packets.
@@ -317,8 +317,16 @@ fn sidecars(path: &str, fs: &dyn MoveFs) -> std::result::Result<Vec<(PathBuf, Si
             .chain(crate::sidecar::XMP_SUFFIXES.into_iter().filter(|ext| *ext != "XMP"))
             .map(|ext| p.with_extension(ext))
             .collect();
-        let paths = listed_packets(fs, &candidates)?;
-        v.extend(paths.into_iter().map(|path| (path, naming)));
+        groups.push((naming, existing_packets(fs, &candidates)));
+    }
+    let existing: Vec<_> = groups.iter().flat_map(|(_, paths)| paths.iter().cloned()).collect();
+    if existing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let listing = fs.listed(&existing);
+    let mut v = Vec::new();
+    for (naming, paths) in groups {
+        v.extend(resolve_packets(paths, listing.as_deref())?.into_iter().map(|path| (path, naming)));
     }
     Ok(v)
 }
@@ -326,21 +334,29 @@ fn sidecars(path: &str, fs: &dyn MoveFs) -> std::result::Result<Vec<(PathBuf, Si
 /// Resolve existing packets to their listed spellings before saving or moving them.
 /// Ambiguous case aliases require a complete listing rather than guessing which names are physical.
 pub(crate) fn listed_packets(fs: &dyn MoveFs, candidates: &[PathBuf]) -> std::result::Result<Vec<PathBuf>, String> {
+    let existing = existing_packets(fs, candidates);
+    if existing.is_empty() {
+        return Ok(existing);
+    }
+    let listing = fs.listed(&existing);
+    resolve_packets(existing, listing.as_deref())
+}
+
+/// Probe each candidate once, retaining its priority and removing repeated pathnames.
+fn existing_packets(fs: &dyn MoveFs, candidates: &[PathBuf]) -> Vec<PathBuf> {
     let mut existing = Vec::new();
-    let mut listed = Vec::new();
-    let mut unknown = false;
     for path in candidates {
-        if !fs.is_file(path) || existing.contains(path) {
-            continue;
-        }
-        existing.push(path.clone());
-        match fs.listed(path) {
-            Some(true) => listed.push(path.clone()),
-            Some(false) => {}
-            None => unknown = true,
+        if !existing.contains(path) && fs.is_file(path) {
+            existing.push(path.clone());
         }
     }
-    if existing.len() > 1 && (unknown || listed.is_empty()) {
+    existing
+}
+
+/// Choose physical spellings from a complete snapshot; a lone candidate needs no alias decision.
+fn resolve_packets(existing: Vec<PathBuf>, listing: Option<&[PathBuf]>) -> std::result::Result<Vec<PathBuf>, String> {
+    let listed: Vec<_> = existing.iter().filter(|p| listing.is_some_and(|paths| paths.contains(p))).cloned().collect();
+    if existing.len() > 1 && (listing.is_none() || listed.is_empty()) {
         return Err("cannot identify XMP sidecar filenames from the folder listing".into());
     }
     Ok(if listed.is_empty() { existing } else { listed })
@@ -364,15 +380,25 @@ pub(crate) trait MoveFs {
     /// Another photo file beside the stem-named sidecar `sidecar` that shares its stem (e.g.
     /// `IMG_1.JPG` for `IMG_1.xmp`), which still uses that sidecar.
     fn stem_sibling(&self, sidecar: &Path) -> Option<String>;
-    /// The folder lists an entry spelled exactly like `p` (letter case included). On a
-    /// case-insensitive volume `a.XMP` "exists" when only `a.xmp` is there; this tells the two
-    /// apart. `None` means the directory or any entry could not be read.
-    fn listed(&self, p: &Path) -> Option<bool> {
-        let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return None };
-        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-        let mut found = false;
-        for entry in std::fs::read_dir(dir).ok()? {
-            found |= entry.ok()?.file_name() == name;
+    /// Candidate paths whose exact spellings are listed, reading each parent directory once.
+    /// Case-insensitive aliases are excluded. `None` means a directory or any entry could not
+    /// be read: even a match observed before that failure is an incomplete snapshot.
+    fn listed(&self, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
+        let mut parents = Vec::new();
+        for path in paths {
+            let dir = path.parent()?;
+            path.file_name()?;
+            if !parents.contains(&dir) {
+                parents.push(dir);
+            }
+        }
+        let mut found = Vec::new();
+        for parent in parents {
+            let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+            for entry in std::fs::read_dir(dir).ok()? {
+                let name = entry.ok()?.file_name();
+                found.extend(paths.iter().filter(|p| p.parent() == Some(parent) && p.file_name() == Some(name.as_os_str())).cloned());
+            }
         }
         Some(found)
     }
@@ -1217,8 +1243,7 @@ pub(crate) mod tests {
         std::fs::write(&other, b"packet").unwrap();
         assert!(RealFs.same_file(&real, &alias) && RealFs.same_file(&alias, &real));
         assert!(!RealFs.same_file(&real, &other) && !RealFs.same_file(&other, &alias));
-        assert_eq!(RealFs.listed(&real), Some(true));
-        assert_eq!(RealFs.listed(&alias), Some(false));
+        assert_eq!(RealFs.listed(&[real.clone(), alias]), Some(vec![real]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1253,6 +1278,7 @@ pub(crate) mod tests {
         pub ci: bool,
         pub files: RefCell<Vec<(String, Vec<u8>)>>,
         pub fail: RefCell<Vec<String>>,
+        listing_calls: std::cell::Cell<usize>,
     }
 
     impl FakeFs {
@@ -1261,6 +1287,7 @@ pub(crate) mod tests {
                 ci,
                 files: RefCell::new(files.iter().map(|(p, c)| (p.to_string(), c.as_bytes().to_vec())).collect()),
                 fail: RefCell::new(Vec::new()),
+                listing_calls: std::cell::Cell::new(0),
             }
         }
         /// The model volume spells paths with `/`; the code under test joins them with the host's separator.
@@ -1324,9 +1351,10 @@ pub(crate) mod tests {
             self.files.borrow_mut().remove(i);
             Ok(())
         }
-        fn listed(&self, p: &Path) -> Option<bool> {
-            let p = Self::norm(p);
-            Some(self.files.borrow().iter().any(|(f, _)| f.replace('\\', "/") == p))
+        fn listed(&self, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
+            self.listing_calls.set(self.listing_calls.get() + 1);
+            let files = self.files.borrow();
+            Some(paths.iter().filter(|p| files.iter().any(|(f, _)| f.replace('\\', "/") == Self::norm(p))).cloned().collect())
         }
         fn stem_sibling(&self, sidecar: &Path) -> Option<String> {
             let stem = Self::norm(&sidecar.with_extension(""));
@@ -1526,6 +1554,25 @@ pub(crate) mod tests {
         assert!(move_file_with(&fs, "/p/A.JPG", "/p/B.JPG").is_err());
     }
 
+    /// Both sidecar namings share a directory scan, even when every suffix answers as an alias.
+    #[test]
+    fn xmp_candidates_share_one_directory_listing() {
+        for ci in [false, true] {
+            let fs = FakeFs::new(ci, &[("/p/a.JFIF", "photo"), ("/p/a.Xmp", "stem"), ("/p/a.JFIF.xMp", "full")]);
+            let packets = sidecars("/p/a.JFIF", &fs).unwrap();
+            assert_eq!(packets.len(), 2);
+            assert_eq!(fs.listing_calls.get(), 1, "both namings use one complete snapshot: {ci}");
+            fs.listing_calls.set(0);
+            let candidates: Vec<_> = ["a", "a.JFIF"]
+                .into_iter()
+                .flat_map(|stem| crate::sidecar::XMP_SUFFIXES.map(|ext| Path::new("/p").join(format!("{stem}.{ext}"))))
+                .collect();
+            let packets = listed_packets(&fs, &candidates).unwrap();
+            assert_eq!(packets.len(), 2);
+            assert_eq!(fs.listing_calls.get(), 1, "save resolves all suffixes together: {ci}");
+        }
+    }
+
     /// Recognized sidecar spellings move with the photo and remain tracked after partial failures.
     #[test]
     fn xmp_case_variants_follow_renames_and_partial_move_repairs() {
@@ -1580,8 +1627,8 @@ pub(crate) mod tests {
             fn is_file(&self, p: &Path) -> bool {
                 self.0.is_file(p)
             }
-            fn listed(&self, p: &Path) -> Option<bool> {
-                if self.1 { None } else { self.0.listed(p) }
+            fn listed(&self, paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
+                if self.1 { None } else { self.0.listed(paths) }
             }
             fn same_file(&self, a: &Path, b: &Path) -> bool {
                 self.0.same_file(a, b)
